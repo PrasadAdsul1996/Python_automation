@@ -1,0 +1,174 @@
+!pip install snowflake-connector-python
+!pip install pandas
+!pip install pygsheets
+!pip install --upgrade gspread
+!pip install google-api-python-client
+
+## python external packages ##
+import snowflake.connector
+import pandas as pd
+from google.colab import drive, auth
+import gspread
+from google.auth import default
+from google.auth.transport.requests import Request
+import logging, os, json
+from googleapiclient.discovery import build
+
+# Mount Google Drive
+drive.mount('/content/drive/', force_remount=True)
+
+# Snowflake connection parameters
+snowflake_user = 'Pyautomation'
+snowflake_password = 'Zxcvbnm@1'
+snowflake_account = 'iepdhyv-djb29657'
+snowflake_database = 'orgdb'
+snowflake_schema = 'demoschema'
+
+def snowflake_connect():
+    # Establish connection to Snowflake
+    return snowflake.connector.connect(
+        user=snowflake_user,
+        password=snowflake_password,
+        account=snowflake_account,
+        database=snowflake_database,
+        schema=snowflake_schema
+    )
+
+
+def query_to_snowflake(snowflake_table):
+    cur = None
+    conn = None
+    try:
+        conn = snowflake_connect()
+
+        # Create a cursor object
+        cur = conn.cursor()
+
+        # Execute describe query to get table schema
+        query = f"DESCRIBE TABLE {snowflake_table}"
+        cur.execute(query)
+
+        # Fetch all results
+        results = cur.fetchall()
+
+        # Extract only "name" and "type" columns from results
+        schema_data = [[row[0], row[1]] for row in results]
+
+        # Create DataFrame with "name" and "type" columns
+        org6account = pd.DataFrame(schema_data, columns=['name', 'type'])
+
+        return org6account
+    except Exception as e:
+        print(f'ERROR:: {e}')
+    finally:
+        # Close cursor and connection
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+
+def get_df_from_gsheet(sheet_id):
+    auth.authenticate_user()
+
+    # Obtain credentials.
+    credentials, _ = default()
+
+    # Authorize gspread using obtained credentials.
+    gc = gspread.authorize(credentials)
+
+    worksheet = gc.open_by_key(sheet_id).sheet1
+
+    rows = worksheet.get_all_values()
+
+    gsheetdf = pd.DataFrame.from_records(rows[1:], columns=rows[0])
+    return gsheetdf
+
+
+def get_mapping(snowflake_table):
+  json_path = f'/content/drive/MyDrive/Data_dictionary_Storage/{snowflake_table}.json'
+  if os.path.exists(json_path):
+    with open(json_path) as f:
+      return json.load(f)
+  else:
+    return {}
+
+
+def get_missing_report(org6account, gsheetdf, snowflake_table=None):
+
+    mapping_info = get_mapping(snowflake_table)
+    gsheetdf['old_name'] = gsheetdf.apply(lambda row:
+      (
+          mapping_info[row['name'].upper()] if row['name'].upper() in mapping_info else row['name'].upper()
+      ),
+      axis=1
+      )
+
+    ## Outer join between two dataframe
+    final_comparison = pd.merge(org6account, gsheetdf, left_on='name', right_on='old_name', how='outer', indicator=True, suffixes=('(org62)', '(orgsf)'))
+    final_comparison['Name(org62)'] = final_comparison.apply(lambda row:
+     (
+         row['name(org62)'] if (row['_merge'].lower() in ['both', 'left_only']) else ''
+    ),
+    axis=1)
+
+    final_comparison['Name(orgsf)'] = final_comparison.apply(lambda row:
+    (
+      row['name(orgsf)'] if (row['_merge'].lower() in ['both', 'right_only']) else ''
+    ),
+    axis=1)
+
+     ## Rename column from type(org62) to Type(org62) and type(orgsf) to Type(orgsf)
+    final_comparison = final_comparison.rename(columns={'type(org62)': 'Type(org62)', 'type(orgsf)': 'Type(orgsf)'})
+    final_comparison['Type(org62)'].fillna('', inplace=True)
+    final_comparison['Type(orgsf)'].fillna('', inplace=True)
+
+    final_comparison['Name(org62Vsorgsf)'] = final_comparison.apply(lambda row:
+     (
+         'Match' if row['Name(org62)'] and row['Name(orgsf)'] and  row['old_name']  and (str(row['Name(org62)']).lower() == str(row['old_name']).lower() and str(row['Name(org62)']).lower() == str(row['Name(orgsf)']).lower())
+         else 'Match(Renamed)' if row['Name(org62)'] and row['Name(orgsf)'] and row['old_name'] and (str(row['Name(org62)']).lower() == str(row['old_name']).lower() and str(row['Name(org62)']).lower() != str(row['Name(orgsf)']).lower())
+         else 'Newly added in orgsf' if not row['Name(org62)']
+         else 'Missing in orgsf' if not row['Name(orgsf)']
+         else 'Not Match'
+    ),
+    axis=1)
+
+    final_comparison['Type(org62Vsorgsf)'] = final_comparison.apply(lambda row:
+     (
+        'Match' if row['Type(org62)'] and row['Type(orgsf)'] and str(row['Type(org62)']).lower() == str(row['Type(orgsf)']).lower()
+         else 'Newly added in orgsf' if not row['Type(org62)']
+         else'Missing in orgsf' if not row['Type(orgsf)']
+         else 'Not Match'
+    ),
+    axis=1)
+
+    final_comparison = final_comparison[['Name(org62)', 'Name(orgsf)', 'Type(org62)', 'Type(orgsf)', 'Name(org62Vsorgsf)', 'Type(org62Vsorgsf)' ]]
+    display(final_comparison)
+    return final_comparison
+
+
+def write_to_gsheet(final_output, snowflake_table, folder_id): #12wrgKgX8SadpywAJ13ndGmsSoHR49oux
+    auth.authenticate_user()
+    credentials, _ = default()
+    gc = gspread.authorize(credentials)
+    write_path = f'/content/drive/MyDrive/Compare_poc/{snowflake_table}_compare_report.gsheet'
+    if os.path.exists(write_path):
+      os.remove(write_path)
+      sh = gc.create(f'{snowflake_table}_compare_report', folder_id = folder_id)
+    else:
+      sh = gc.create(f'{snowflake_table}_compare_report', folder_id = folder_id)
+    worksheet = sh.get_worksheet(0)
+    worksheet.update([final_output.columns.values.tolist()] + final_output.values.tolist())
+    return sh
+
+if __name__ == '__main__':
+    snowflake_tables = ['Demo_account'] ## TODO:: Need to extract from snowflake information schema table (<db>.information_schema.tables)
+    sheet_ids = ['16xF7PI_6wo4V2lopaOsPseJ6YqE6bHPWo_Q8-WuCHg0'] ##  16xF7PI_6wo4V2lopaOsPseJ6YqE6bHPWo_Q8-WuCHg0 TODO:: Need to read from gsheet
+    # write_sheet_names = ['Account_output']  ## TODO:: File name should be same as snowflake table to keep consistancy for missing report file name
+
+    for snowflake_table, sheet_id in zip(snowflake_tables, sheet_ids):
+        org6account = query_to_snowflake(snowflake_table)
+        gsheetdf = get_df_from_gsheet(sheet_id)
+        final_output = get_missing_report(org6account, gsheetdf, snowflake_table=snowflake_table)
+        new_sheet = write_to_gsheet(final_output, snowflake_table=snowflake_table, folder_id='12wrgKgX8SadpywAJ13ndGmsSoHR49oux')
+        print(f"New Google Sheet created: {new_sheet.url}")
